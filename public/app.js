@@ -34,6 +34,12 @@ const els = {
   reprintRunCsvBtn: document.getElementById('reprintRunCsvBtn'),
   reprintRunInfo: document.getElementById('reprintRunInfo'),
   reprintRunList: document.getElementById('reprintRunList'),
+  saveBaselineBtn: document.getElementById('saveBaselineBtn'),
+  compareReuseBtn: document.getElementById('compareReuseBtn'),
+  clearBaselineBtn: document.getElementById('clearBaselineBtn'),
+  baselineInfo: document.getElementById('baselineInfo'),
+  reuseInfo: document.getElementById('reuseInfo'),
+  reuseList: document.getElementById('reuseList'),
   summary: document.getElementById('summary'),
   sheets: document.getElementById('sheets'),
   errors: document.getElementById('errors'),
@@ -58,6 +64,10 @@ let validateTimer = null;
 let repairPlan = null; // 当前修复方案 { steps, fingerprint, baseJson, stale }
 let reprintData = null; // 最近一次成功的补印清单（用于控制补印打样下载按钮）
 let reprintRunData = null; // 最近一次成功的生产单 { plan, baseStateJson, baseInput }（拼版或输入变化后失效）
+let baseline = null; // 比较基线 { state, savedAt }（仅保存在当前浏览器会话：sessionStorage）
+let reuseResult = null; // 最近一次比较结果 { result, baseCurrentJson }（拼版变化后失效）
+
+const BASELINE_KEY = 'plateReuseBaseline'; // sessionStorage 键：基线仅保存在当前浏览器会话
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -123,6 +133,7 @@ function setLayout(next) {
     els.proofBtn.disabled = true;
     els.errors.innerHTML = '<p class="muted">已切换拼版模式，请重新点击「生成拼版」。</p>';
     refreshReprint();
+    refreshReuse();
   }
 }
 
@@ -209,6 +220,7 @@ function render() {
   els.repairPlanBtn.disabled = false;
   updateModeUI();
   refreshReprintRun(); // 拼版内容可能已变化：旧生产单立即失效
+  refreshReuse(); // 拼版内容可能已变化：旧比较结果立即失效
 }
 
 function renderSignature(g) {
@@ -871,6 +883,154 @@ async function downloadReprintProof() {
   URL.revokeObjectURL(url);
 }
 
+/* ---------- 改版印版复用 ---------- */
+
+/** 拼版概要文字（基线信息用）：成品页数、帖数（分帖）、纸张数、面数 */
+function stateBrief(st) {
+  const sheets = st.sheetCount;
+  const faces = sheets * 2;
+  const mode = st.signatureCount ? ` · ${st.signatureCount} 帖` : '';
+  return `成品 ${st.pages} 页（补齐至 ${st.totalPages} 页）${mode} · ${sheets} 张纸 · ${faces} 个印版面`;
+}
+
+/** 渲染基线信息区 */
+function renderBaselineInfo() {
+  els.baselineInfo.innerHTML = '';
+  const p = document.createElement('p');
+  if (!baseline) {
+    p.className = 'muted';
+    p.textContent = '尚未保存基线（基线仅保存在当前浏览器会话）。';
+  } else {
+    p.className = 'reuse-baseline';
+    const time = new Date(baseline.savedAt).toLocaleTimeString('zh-CN', { hour12: false });
+    p.textContent = `基线：${stateBrief(baseline.state)} · 保存于 ${time}`;
+  }
+  els.baselineInfo.appendChild(p);
+}
+
+/** 保存基线：仅允许校验通过的拼版；基线存入 sessionStorage（仅当前浏览器会话） */
+async function saveBaseline() {
+  if (!state) {
+    alert('请先生成拼版，再保存为比较基线。');
+    return;
+  }
+  try {
+    const result = await api('/api/validate', state);
+    if (!result.valid) {
+      alert('当前拼版未通过校验，不能保存为比较基线；请先修复或重置。');
+      return;
+    }
+  } catch (e) {
+    alert(`校验失败，无法保存基线：${e.message}`);
+    return;
+  }
+  baseline = { state: structuredClone(state), savedAt: Date.now() };
+  try {
+    sessionStorage.setItem(BASELINE_KEY, JSON.stringify(baseline));
+  } catch {
+    // sessionStorage 不可用（如隐私模式）时基线仅保留在本页内存中，仍属当前会话
+  }
+  reuseResult = null;
+  renderBaselineInfo();
+  renderReuseResult();
+}
+
+/** 清除基线（同时废弃旧比较结果） */
+function clearBaseline() {
+  baseline = null;
+  try {
+    sessionStorage.removeItem(BASELINE_KEY);
+  } catch {
+    // 忽略存储异常
+  }
+  reuseResult = null;
+  renderBaselineInfo();
+  renderReuseResult();
+}
+
+/** 面位置标签：单帖「第 N 张纸 · 正面」，分帖「第 S 帖 · 第 N 张纸 · 正面」 */
+function faceLabel(face) {
+  const where = face.sig == null ? `第 ${face.sheet} 张纸` : `第 ${face.sig} 帖 · 第 ${face.sheet} 张纸`;
+  return `${where} · ${SIDE_LABEL[face.side]}`;
+}
+
+/** 发起比较：服务端对基线与当前方案分别校验，任一未通过即拒绝核算 */
+async function compareReuse() {
+  if (!baseline) {
+    alert('请先「保存为比较基线」。');
+    return;
+  }
+  if (!state) {
+    alert('请先生成拼版，再发起比较。');
+    return;
+  }
+  try {
+    const result = await api('/api/plate/reuse', { baseline: baseline.state, current: state });
+    reuseResult = { result, baseCurrentJson: JSON.stringify(state) };
+    renderReuseResult();
+  } catch (e) {
+    reuseResult = null;
+    renderReuseMessage('reuse-err', e.message);
+  }
+}
+
+function renderReuseMessage(cls, text) {
+  els.reuseInfo.innerHTML = '';
+  els.reuseList.innerHTML = '';
+  if (!text) return;
+  const p = document.createElement('p');
+  p.className = cls;
+  p.textContent = text;
+  els.reuseInfo.appendChild(p);
+}
+
+/** 渲染比较结果：汇总复用 / 新制 / 旧面作废数量，并按当前帖与纸张顺序逐面标明 */
+function renderReuseResult() {
+  els.reuseInfo.innerHTML = '';
+  els.reuseList.innerHTML = '';
+  if (!reuseResult) return;
+
+  const r = reuseResult.result;
+  const summary = document.createElement('p');
+  summary.className = 'reuse-ok';
+  summary.textContent =
+    `复用 ${r.reused} 面 · 新制 ${r.newMade} 面 · 旧面作废 ${r.discarded} 面` +
+    `（基线 ${r.baselineFaceCount} 面 → 当前 ${r.faceCount} 面）`;
+  els.reuseInfo.appendChild(summary);
+
+  for (const face of r.faces) {
+    const li = document.createElement('li');
+    li.className = `reuse-face ${face.status}`;
+
+    const head = document.createElement('div');
+    head.className = 'reuse-face-head';
+    const where = document.createElement('strong');
+    where.textContent = faceLabel(face);
+    const badge = document.createElement('span');
+    badge.className = 'reuse-badge';
+    badge.textContent = face.status === 'reuse' ? '复用' : '新制';
+    head.append(where, badge);
+    li.appendChild(head);
+
+    if (face.status === 'reuse') {
+      const src = document.createElement('div');
+      src.className = 'reuse-source';
+      src.textContent = `复用自：${faceLabel(face.source)}`;
+      li.appendChild(src);
+    }
+    els.reuseList.appendChild(li);
+  }
+}
+
+/** 拼版变化后旧比较结果失效：清空并提示重新发起比较 */
+function refreshReuse() {
+  if (!reuseResult) return;
+  if (!state || JSON.stringify(state) !== reuseResult.baseCurrentJson) {
+    reuseResult = null;
+    renderReuseMessage('muted', state ? '拼版已变化，旧比较结果已失效，请重新「发起比较」。' : '');
+  }
+}
+
 /* ---------- 导出 ---------- */
 
 /** 下载结果文件（CSV / 打样 HTML）的通用逻辑 */
@@ -973,6 +1133,23 @@ els.editModeBtn.addEventListener('click', () => {
   selected = null;
   render();
 });
+els.saveBaselineBtn.addEventListener('click', saveBaseline);
+els.compareReuseBtn.addEventListener('click', compareReuse);
+els.clearBaselineBtn.addEventListener('click', clearBaseline);
+
+// 页面加载时恢复本会话内保存的比较基线（sessionStorage 随标签页关闭而清除，不做持久化）
+try {
+  const saved = sessionStorage.getItem(BASELINE_KEY);
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    if (parsed && parsed.state && typeof parsed.savedAt === 'number') {
+      baseline = parsed;
+    }
+  }
+} catch {
+  // 存储不可用或数据损坏：按无基线处理
+}
+renderBaselineInfo();
 
 setLayout('single');
 updateModeUI();
