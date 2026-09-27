@@ -36,6 +36,12 @@ const crypto = require('crypto');
  * 需求份数与随印超出份数（实际补印份数 − 该页需求份数）；生产单按帖号、帖内
  * 纸张序排列并汇总实体纸张总用量（各张实际补印份数之和），可下载与屏幕结果
  * 一致的 CSV。
+ *
+ * 改版印版复用：把一份校验通过的拼版作为比较基线，与改版后的当前拼版按
+ * 「印版面」（一张纸的一面）逐一匹配——正反面别、左右页码及空白版位、该面
+ * 实际爬移量均相同才可复用；匹配跨帖号与纸张序号查找，但每个旧面最多匹配
+ * 一个新面。任一方案未通过服务端校验时拒绝核算。结果按当前帖与纸张顺序
+ * 标明各面「复用 / 新制」及复用来源，并汇总复用、新制与旧面作废数量。
  */
 
 const SIDES = ['front', 'back'];
@@ -1150,6 +1156,115 @@ function buildReprintRunCsv(raw, input) {
   return { csv: '﻿' + rows.map((r) => r.join(',')).join('\r\n') + '\r\n', plan };
 }
 
+/* ---------- 改版印版复用 ---------- */
+
+/**
+ * 展开一份已规范化拼版的全部印版面（每张纸的正、反两面），
+ * 按帖号（单帖 sig 为 null）→ 帖内纸张序号 → 面（正/反）的固定顺序返回。
+ * 每面含左右版位内容（页码或 null 空白）与该面实际爬移量（未启用爬移时为 0）。
+ */
+function listFaces(state) {
+  const groups = state.mode === 'multi'
+    ? state.signatures
+    : [{ sig: null, sheets: state.sheets }];
+  const faces = [];
+  for (const g of groups) {
+    for (const s of g.sheets) {
+      for (const side of SIDES) {
+        faces.push({
+          sig: s.sig ?? null,
+          sheet: s.index,
+          side,
+          left: s[side].left,
+          right: s[side].right,
+          creep: state.creep ? s.creep : 0,
+        });
+      }
+    }
+  }
+  return faces;
+}
+
+/** 印版面匹配键：正反面别 + 左右页码及空白版位 + 该面实际爬移量，均相同才可复用 */
+function faceKey(face) {
+  const cell = (v) => (v === null ? 'x' : v);
+  return `${face.side}|${cell(face.left)}|${cell(face.right)}|${face.creep}`;
+}
+
+/**
+ * 改版印版复用比较：以基线拼版为旧版、当前拼版为新版，按印版面逐一匹配。
+ * 两个方案都必须通过服务端校验，任一未通过即拒绝核算（返回 { error, errors }，
+ * 说明是哪一方未通过及原因）；结构非法返回 null。
+ *
+ * 匹配规则：正反面别、左右页码及空白版位、该面实际爬移量均相同才可复用；
+ * 跨帖号与纸张序号查找（旧面可来自基线的任意帖 / 任意纸张），但每个旧面最多
+ * 匹配一个新面（按基线帖号 → 纸张序号 → 面别的固定顺序先到先得）。
+ *
+ * 成功返回 { summary, faces }：
+ *  - summary   { reused, new, discarded }：复用面数、新制面数、旧面作废面数；
+ *  - faces     按当前帖与纸张顺序排列的各面结果，每项含面别、左右版位、
+ *              status（'reuse' 复用 / 'new' 新制），复用面附 source（基线来源
+ *              纸张的帖号与纸张序号，单帖无 sig 字段）；启用爬移补偿时附 creep。
+ */
+function comparePlateReuse(baselineRaw, currentRaw) {
+  const baselineState = normalizeState(baselineRaw);
+  const currentState = normalizeState(currentRaw);
+  if (!baselineState || !currentState) return null;
+
+  const baselineValidation = validateImposition(baselineRaw);
+  if (!baselineValidation.valid) {
+    return {
+      error: `基线拼版未通过服务端校验（${summarizeErrors(baselineValidation.errors)}），请重新保存基线`,
+      errors: baselineValidation.errors,
+    };
+  }
+  const currentValidation = validateImposition(currentRaw);
+  if (!currentValidation.valid) {
+    return {
+      error: `当前拼版未通过服务端校验（${summarizeErrors(currentValidation.errors)}），请先修复或重置后再比较`,
+      errors: currentValidation.errors,
+    };
+  }
+
+  const oldFaces = listFaces(baselineState);
+  const newFaces = listFaces(currentState);
+
+  // 旧面按匹配键分桶（桶内保持基线固定顺序），每个旧面出队一次即被占用，最多匹配一个新面
+  const pool = new Map();
+  oldFaces.forEach((face, i) => {
+    const key = faceKey(face);
+    if (!pool.has(key)) pool.set(key, []);
+    pool.get(key).push(i);
+  });
+
+  const faces = [];
+  let reused = 0;
+  for (const nf of newFaces) {
+    const queue = pool.get(faceKey(nf));
+    const entry = { sheet: nf.sheet, side: nf.side, left: nf.left, right: nf.right };
+    if (nf.sig != null) entry.sig = nf.sig;
+    if (currentState.creep) entry.creep = nf.creep;
+    if (queue && queue.length) {
+      const of = oldFaces[queue.shift()];
+      entry.status = 'reuse';
+      entry.source = of.sig == null ? { sheet: of.sheet } : { sig: of.sig, sheet: of.sheet };
+      reused += 1;
+    } else {
+      entry.status = 'new';
+    }
+    faces.push(entry);
+  }
+
+  return {
+    summary: {
+      reused,
+      new: newFaces.length - reused,
+      discarded: oldFaces.length - reused,
+    },
+    faces,
+  };
+}
+
 /** 生成 CSV（带 BOM，Excel 友好）；结构非法返回 null */
 function buildCsv(raw) {
   const state = normalizeState(raw);
@@ -1228,4 +1343,5 @@ module.exports = {
   parseReprintQuotas,
   planReprintRun,
   buildReprintRunCsv,
+  comparePlateReuse,
 };

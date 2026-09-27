@@ -15,6 +15,7 @@ const {
   buildReprintProofHtml,
   planReprintRun,
   buildReprintRunCsv,
+  comparePlateReuse,
 } = require('./src/imposition');
 
 const app = express();
@@ -182,6 +183,19 @@ app.post('/api/reprint/run/csv', (req, res) => {
     : `reprint-run-${st.totalPages}p.csv`;
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.send(result.csv);
+});
+
+/** 改版印版复用：基线与当前拼版均须通过服务端校验，按印版面匹配可复用旧版，任一未通过即拒绝 */
+app.post('/api/reuse/compare', (req, res) => {
+  const body = req.body || {};
+  const result = comparePlateReuse(body.baseline, body.current);
+  if (!result) {
+    return res.status(400).json({ error: '拼版数据格式不正确' });
+  }
+  if (result.error) {
+    return res.status(400).json({ error: result.error, errors: result.errors });
+  }
+  res.json(result);
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));

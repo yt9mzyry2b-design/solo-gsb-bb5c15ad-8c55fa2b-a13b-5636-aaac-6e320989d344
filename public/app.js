@@ -34,6 +34,12 @@ const els = {
   reprintRunCsvBtn: document.getElementById('reprintRunCsvBtn'),
   reprintRunInfo: document.getElementById('reprintRunInfo'),
   reprintRunList: document.getElementById('reprintRunList'),
+  saveBaselineBtn: document.getElementById('saveBaselineBtn'),
+  compareReuseBtn: document.getElementById('compareReuseBtn'),
+  clearBaselineBtn: document.getElementById('clearBaselineBtn'),
+  baselineInfo: document.getElementById('baselineInfo'),
+  reuseResult: document.getElementById('reuseResult'),
+  reuseList: document.getElementById('reuseList'),
   summary: document.getElementById('summary'),
   sheets: document.getElementById('sheets'),
   errors: document.getElementById('errors'),
@@ -58,6 +64,9 @@ let validateTimer = null;
 let repairPlan = null; // 当前修复方案 { steps, fingerprint, baseJson, stale }
 let reprintData = null; // 最近一次成功的补印清单（用于控制补印打样下载按钮）
 let reprintRunData = null; // 最近一次成功的生产单 { plan, baseStateJson, baseInput }（拼版或输入变化后失效）
+let baseline = null; // 改版印版复用基线 { state, label, time }，仅存于当前浏览器会话
+let reuseData = null; // 最近一次复用比较结果 { result, baseStateJson }（当前拼版变化后失效）
+const BASELINE_STORAGE_KEY = 'plateReuseBaseline';
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -209,6 +218,7 @@ function render() {
   els.repairPlanBtn.disabled = false;
   updateModeUI();
   refreshReprintRun(); // 拼版内容可能已变化：旧生产单立即失效
+  refreshReuse();
 }
 
 function renderSignature(g) {
@@ -715,6 +725,7 @@ function refreshReprint() {
     generateReprintPlan();
   }
   refreshReprintRun();
+  refreshReuse();
 }
 
 /* ---------- 补印生产单（按页份数核算） ---------- */
@@ -871,6 +882,176 @@ async function downloadReprintProof() {
   URL.revokeObjectURL(url);
 }
 
+/* ---------- 改版印版复用 ---------- */
+
+/** 拼版摘要文本（基线信息展示用） */
+function describeState(s) {
+  const parts = [`成品 ${s.pages} 页`];
+  if (s.signatures) parts.push(`${s.signatureCount} 帖`);
+  parts.push(`${s.sheetCount} 张纸`);
+  if (s.creep) {
+    parts.push(`爬移纸厚 ${s.creep.thickness.toFixed(2)} mm、上限 ${s.creep.cap.toFixed(2)} mm`);
+  }
+  return parts.join(' · ');
+}
+
+/** 启动时从当前浏览器会话恢复基线（关闭标签页即清除） */
+function loadBaseline() {
+  try {
+    const raw = sessionStorage.getItem(BASELINE_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    if (parsed && parsed.state && parsed.label) baseline = parsed;
+  } catch {
+    baseline = null;
+  }
+}
+
+/** 保存为比较基线：先经服务端校验通过才保存（仅保存在当前浏览器会话） */
+async function saveBaseline() {
+  if (!state) return;
+  try {
+    const result = await api('/api/validate', state);
+    if (!result.valid) {
+      alert('当前拼版未通过校验，不能保存为比较基线，请先修复或重置。');
+      return;
+    }
+  } catch (e) {
+    alert(`校验请求失败，无法保存基线：${e.message}`);
+    return;
+  }
+  baseline = {
+    state: structuredClone(state),
+    label: describeState(state),
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+  };
+  try {
+    sessionStorage.setItem(BASELINE_STORAGE_KEY, JSON.stringify(baseline));
+  } catch {
+    // 会话存储不可用时仍保留在内存中（当前标签页会话内有效）
+  }
+  reuseData = null;
+  els.reuseResult.innerHTML = '';
+  els.reuseList.innerHTML = '';
+  renderBaselineInfo();
+  refreshReuse();
+}
+
+function clearBaseline() {
+  baseline = null;
+  reuseData = null;
+  try {
+    sessionStorage.removeItem(BASELINE_STORAGE_KEY);
+  } catch {
+    /* 忽略 */
+  }
+  els.reuseResult.innerHTML = '';
+  els.reuseList.innerHTML = '';
+  renderBaselineInfo();
+  refreshReuse();
+}
+
+function renderBaselineInfo() {
+  els.baselineInfo.innerHTML = '';
+  if (!baseline) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '尚未保存基线：生成拼版且校验通过后点击「保存为比较基线」。';
+    els.baselineInfo.appendChild(p);
+    return;
+  }
+  const p = document.createElement('p');
+  p.className = 'reuse-baseline';
+  p.textContent = `基线：${baseline.label} · 保存于 ${baseline.time}（仅当前浏览器会话有效）`;
+  els.baselineInfo.appendChild(p);
+}
+
+/** 与基线比较：服务端对两个方案逐一校验，任一未通过即拒绝核算 */
+async function compareReuse() {
+  if (!state || !baseline) return;
+  try {
+    const data = await api('/api/reuse/compare', { baseline: baseline.state, current: state });
+    reuseData = { result: data, baseStateJson: JSON.stringify(state) };
+    renderReuseResult(data);
+  } catch (e) {
+    reuseData = null;
+    els.reuseList.innerHTML = '';
+    els.reuseResult.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'reprint-err';
+    p.textContent = e.message;
+    els.reuseResult.appendChild(p);
+  }
+}
+
+/** 渲染比较结果：按当前帖与纸张顺序列出每张纸正/反面的复用 / 新制及复用来源，并汇总数量 */
+function renderReuseResult(data) {
+  els.reuseResult.innerHTML = '';
+  const s = data.summary;
+  const p = document.createElement('p');
+  p.className = 'reprint-ok';
+  p.textContent =
+    `复用 ${s.reused} 面 · 新制 ${s.new} 面 · 旧面作废 ${s.discarded} 面` +
+    `（当前方案共 ${s.reused + s.new} 面，按当前帖与纸张顺序）：`;
+  els.reuseResult.appendChild(p);
+
+  els.reuseList.innerHTML = '';
+  let li = null;
+  let slotsBox = null;
+  let lastKey = null;
+  for (const f of data.faces) {
+    const key = `${f.sig ?? ''}|${f.sheet}`;
+    if (key !== lastKey) {
+      lastKey = key;
+      li = document.createElement('li');
+      li.className = 'reprint-sheet';
+      const head = document.createElement('div');
+      head.className = 'reprint-sheet-head';
+      const where = document.createElement('strong');
+      where.textContent = f.sig == null
+        ? `第 ${f.sheet} 张纸`
+        : `第 ${f.sig} 帖 · 第 ${f.sheet} 张纸`;
+      head.appendChild(where);
+      slotsBox = document.createElement('div');
+      slotsBox.className = 'reprint-slots';
+      li.append(head, slotsBox);
+      els.reuseList.appendChild(li);
+    }
+
+    const line = document.createElement('span');
+    const badge = document.createElement('span');
+    badge.className = `reuse-badge ${f.status}`;
+    badge.textContent = f.status === 'reuse' ? '复用' : '新制';
+    const detail = document.createElement('span');
+    const creepNote = typeof f.creep === 'number' && f.creep > 0 ? ` · 爬移 ${f.creep.toFixed(2)} mm` : '';
+    detail.textContent =
+      `${SIDE_LABEL[f.side]}：左版 ${valueLabel(f.left)} · 右版 ${valueLabel(f.right)}${creepNote}`;
+    line.append(badge, detail);
+    if (f.status === 'reuse') {
+      const source = document.createElement('span');
+      source.className = 'reuse-source';
+      source.textContent =
+        ` ← 沿用基线${f.source.sig == null ? '' : `第 ${f.source.sig} 帖 · `}第 ${f.source.sheet} 张纸 ${SIDE_LABEL[f.side]}`;
+      line.appendChild(source);
+    }
+    slotsBox.appendChild(line);
+  }
+}
+
+/** 拼版变化后同步复用区：更新按钮状态；比较结果基于的当前拼版已变化时立即失效 */
+function refreshReuse() {
+  els.saveBaselineBtn.disabled = !state;
+  els.compareReuseBtn.disabled = !state || !baseline;
+  els.clearBaselineBtn.disabled = !baseline;
+  if (reuseData && (!state || JSON.stringify(state) !== reuseData.baseStateJson)) {
+    reuseData = null;
+    els.reuseList.innerHTML = '';
+    els.reuseResult.innerHTML = state
+      ? '<p class="muted">当前拼版已变化，旧比较结果已失效，请重新点击「与基线比较」。</p>'
+      : '';
+  }
+}
+
 /* ---------- 导出 ---------- */
 
 /** 下载结果文件（CSV / 打样 HTML）的通用逻辑 */
@@ -936,6 +1117,9 @@ els.reprintInput.addEventListener('input', () => {
 });
 els.reprintRunBtn.addEventListener('click', generateReprintRun);
 els.reprintRunCsvBtn.addEventListener('click', downloadReprintRunCsv);
+els.saveBaselineBtn.addEventListener('click', saveBaseline);
+els.compareReuseBtn.addEventListener('click', compareReuse);
+els.clearBaselineBtn.addEventListener('click', clearBaseline);
 els.reprintRunInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') generateReprintRun();
 });
@@ -976,3 +1160,6 @@ els.editModeBtn.addEventListener('click', () => {
 
 setLayout('single');
 updateModeUI();
+loadBaseline();
+renderBaselineInfo();
+refreshReuse();
